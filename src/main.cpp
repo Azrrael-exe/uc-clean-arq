@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <domain/temperature.h>
 #include <infrastructure/hal/TemperatureSensor_Dummy.h>
-#include <infrastructure/LM35_Sensor.h>
+#include <infrastructure/hal/LM35_Sensor.h>
 #include <app/alarm_use_case.h>
 
 infrastructure::TemperatureSensor_Dummy dummySensor(25.0, 30.0);
