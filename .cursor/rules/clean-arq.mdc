@@ -1,0 +1,198 @@
+Title: Enforce Clean Architecture (CA) and wiring-only main.cpp in PlatformIO projects
+Scope/Trigger: Apply whenever generating, moving, or editing files in a PlatformIO repository.
+
+Intent:
+Follow the Clean Architecture (CA) pattern with strict separation of concerns and unidirectional dependencies. Outer layers depend on inner layers, never the reverse. Code outside infrastructure/platform must be hardware-agnostic. Only do wiring in src/main.cpp.
+
+Clean Architecture Overview (what this rule enforces):
+- Entities (Domain): Enterprise-wide business rules. Stable, pure C++.
+- Use Cases (Application): Orchestrate domain rules to achieve goals.
+- Interface Adapters: Translate from external formats to domain (adapters) and expose use-cases (interface).
+- Frameworks & Drivers: Technical details and I/O (infrastructure) and board specifics (platform).
+- Dependency Rule: Source code dependencies point inward. Outer layers know about inner layers via interfaces (ports), not concrete implementations.
+
+Authoritative Project Map:
+.
+├─ include/
+│   ├─ app/            # optional: public use-case interfaces
+│   ├─ domain/         # entities, value objects, errors
+│   └─ ports/          # interfaces (ports) the core requires
+├─ src/
+│   ├─ app/            # use-cases (application services)
+│   ├─ adapters/       # DTO <-> domain mapping, validation
+│   ├─ infrastructure/ # implementations of ports (details)
+│   │   ├─ hal/        # drivers: I2C/SPI/UART/ADC/GPIO/PWM, concrete sensors/actuators
+│   │   ├─ os/         # RTOS tasks/queues/timers
+│   │   ├─ storage/    # Flash/EEPROM/FS
+│   │   └─ io/         # logging, metrics, tracing
+│   ├─ platform/       # BSP: pins/clock/startup/linker/init
+│   ├─ interface/
+│   │   ├─ cli/        # commands (shell-style)
+│   │   └─ api/        # protocols: UART/MQTT/etc.
+│   └─ main.cpp        # composition root (wiring only)
+├─ lib/                # reusable internal libraries (each with library.json)
+├─ test/               # host unit tests (env:native) + on-target integration
+├─ scripts/            # pio hooks, generators
+├─ configs/            # dev/qa/prod defines, JSON/TOML
+├─ tools/              # PC-side utils
+└─ platformio.ini
+
+Dependency & Import Rules (hard constraints):
+- Unidirectional deps: platform -> infrastructure -> adapters/interface -> app -> ports/domain. Never the inverse.
+- Prohibited includes outside infrastructure/platform: Arduino.h, vendor HAL, RTOS headers.
+- include/domain/: only C++ standard library and other include/domain/ headers; MUST compile under env:native.
+- include/ports/: may include include/domain/ and STL; no concrete implementations.
+- src/app/: depends only on include/{domain,ports} (and include/app if present). No drivers/Serial/HAL.
+- src/adapters/: mapping/validation only; no HAL/RTOS/FS access.
+- src/infrastructure/: implements include/ports/* using HAL/RTOS/FS; may include Arduino.h and src/platform/*; must not depend on src/app, src/adapters, or src/interface.
+- src/platform/: board config (pins/clock/startup/linker). No business logic.
+- src/interface/: CLI/API; calls use-cases via interfaces; must not depend on src/infrastructure directly.
+- src/main.cpp: wiring only (object construction and DI). No business rules.
+
+Case-by-Case Detailed Guidance (Clean Architecture alignment):
+
+1) include/domain/  (Entities)
+- Purpose: Stable business rules: Entities, Value Objects, typed errors, domain-specific types.
+- Do: Keep pure C++ (STL only), deterministic behavior, no I/O or time; validate invariants here.
+- Don’t: Include Arduino.h, HAL/RTOS headers, or do logging/Serial.
+- Imports: Other include/domain/ headers and the C++ standard library.
+- Quality bar: Must compile with env:native; fast unit tests target this first.
+
+2) include/ports/  (Interfaces/Ports)
+- Purpose: Define boundaries the core needs (e.g., ITemperatureSensor, IClock, IStorage, ILogger).
+- Do: Express methods with domain types; model failure via expected/optional-like patterns.
+- Don’t: Provide implementations, touch hardware, or reference board specifics.
+- Imports: include/domain/ and STL only.
+- Rationale (CA): Depends inward on domain; allows outer layers to plug implementations without coupling.
+
+3) include/app/ (optional, public Use-Case contracts)
+- Purpose: Public-facing interfaces for use-cases when external callers (interface/) must invoke them without knowing concrete classes.
+- Do: Keep use-case method signatures thin; use domain types for inputs/outputs.
+- Don’t: Reference HAL or infrastructure.
+- When to omit: If use-cases are not consumed outside the app layer via interfaces, you can skip this folder.
+
+4) src/app/  (Use Cases / Application Services)
+- Purpose: Orchestrate domain rules; decide “what gets done and when”.
+- Do: Depend only on ports/domain; coordinate policies (e.g., thresholds, retries via ports).
+- Don’t: Open files, talk to HAL, log via Serial, or reference board details.
+- Rationale (CA): Implements application-specific rules; keeps tech details outside. Testable on host.
+
+5) src/adapters/  (Interface Adapters)
+- Purpose: Map/validate payloads between external formats (CLI/API/frames) and domain types.
+- Do: Parse/format DTOs, perform input validation, convert to/from domain; call use-cases via interfaces.
+- Don’t: Touch HAL/RTOS/FS, open sockets/serial directly (use ports/use-cases instead).
+- Rationale (CA): Shields the domain from protocol noise; keeps translations local.
+
+6) src/infrastructure/  (Frameworks & Drivers — Implementations of Ports)
+   6a) hal/
+   - Purpose: Concrete drivers (I2C/SPI/UART/ADC/GPIO/PWM), sensors/actuators implementing ports.
+   - Do: Include Arduino.h/vendor HAL here; read pins/clock from src/platform/.
+   - Don’t: Embed business rules or talk to use-cases directly.
+
+   6b) os/
+   - Purpose: RTOS integration (tasks, queues, timers) to fulfill ports like schedulers, timers, executors.
+   - Do: Encapsulate RTOS primitives behind ports; coordinate only technical concerns.
+   - Don’t: Encode business conditions here.
+
+   6c) storage/
+   - Purpose: Flash/EEPROM/FS implementations of storage ports.
+   - Do: Handle persistence errors robustly; surface domain-friendly errors via ports.
+   - Don’t: Leak file paths/partitions outside; adapters/use-cases should see logical keys/types only.
+
+   6d) io/
+   - Purpose: Logging/metrics/tracing implementations of ports (e.g., SerialLogger).
+   - Do: Respect log levels and formatting; avoid domain decisions.
+   - Don’t: Depend on app/adapters/interface.
+
+- Global infrastructure rules:
+  - May depend on include/{ports,domain} and src/platform/*.
+  - Must not depend on src/app, src/adapters, or src/interface.
+  - No business logic; this is the most volatile layer (easy to swap).
+
+7) src/platform/  (BSP / Board)
+- Purpose: Pins, clocks, startup, linker scripts, hardware init.
+- Do: Centralize board constants (e.g., BoardPins); infrastructure reads from here.
+- Don’t: Put domain rules or use-case logic here.
+- Rationale (CA): Shield the rest of the system from board changes.
+
+8) src/interface/  (External Boundaries: CLI/API)
+- Purpose: Accept external inputs (CLI commands, UART/MQTT messages), call use-cases, emit outputs.
+- Do: Use adapters to map payloads ↔ domain; depend on include/app or use-case interfaces.
+- Don’t: Instantiate concrete infrastructure here; that happens in main.cpp.
+- Rationale (CA): Keeps protocols at the edge; facilitates swapping transports.
+
+9) src/main.cpp  (Composition Root / Wiring Only)
+- Purpose: Build concrete infrastructure implementations, inject them into use-cases, register handlers, and start runtime (loop/RTOS).
+- Do: Create objects, assemble graphs, pass dependencies to use-cases, register CLI/API handlers.
+- Don’t: Implement business rules or protocol parsing here (delegate to adapters/interface).
+- Rationale (CA): Single place to compose; switching boards/drivers becomes localized.
+
+10) lib/  (Reusable internal libraries)
+- Purpose: Modules reused across projects. Each with its own include/ and src/ plus library.json.
+- Rule: Promote to lib/ only when reuse is real; otherwise keep in src/.
+
+11) test/  (Testing Strategy)
+- Unit (host): domain + app under env:native (fast, pure C++).
+- Integration (on-target): critical drivers and end-to-end paths via ports.
+
+File Placement Policy (decision guide):
+- Business rules/entities/value objects/errors → include/domain/ (+ optional src/domain/*.cpp).
+- Core-required interfaces → include/ports/.
+- Use-case orchestration → src/app/.
+- Payload/domain mapping & validation → src/adapters/.
+- HW/RTOS/FS/Serial/ITM access → src/infrastructure/<hal|os|storage|io>/.
+- Pins/clock/BSP/startup/linker → src/platform/.
+- External endpoints (CLI/protocol) → src/interface/{cli|api}/.
+- Reusable across projects → lib/<module>/ with library.json.
+- Tests → test/.
+
+Coding Directives:
+- Ports are thin, stable contracts using domain types; error handling via optional/expected patterns.
+- No global singletons in public headers; inject dependencies from main.cpp.
+- Infrastructure reads pins/clock from src/platform/, never hardcode in drivers.
+- platformio.ini: enable C++20 and treat warnings as errors.
+- Domain/app MUST compile with env:native (no Arduino/HAL leakage).
+
+Generated Code Defaults:
+- New port: declare interface in include/ports/.
+- New driver/impl: implement exactly one port in src/infrastructure/...; may include Arduino/HAL here only.
+- New use-case: put in src/app/; depend on ports only; no Serial/timing.
+- New CLI/API: place in src/interface/{cli|api}/; map through src/adapters/ to domain.
+
+Guardrails the Assistant Must Enforce:
+- Reject Arduino.h/vendor HAL outside src/infrastructure/ or src/platform/.
+- If a change breaks dependency direction, suggest introducing a port or moving code to the correct layer.
+- If business logic appears in main.cpp, move it to a use-case (src/app) or adapter (src/adapters) and keep wiring only in main.cpp.
+- If domain/app fails to compile under env:native due to HW headers, remove those deps and introduce a port.
+
+Anti-Patterns & Auto-Fixes:
+- Domain logging with Serial → introduce ILogger port; implement in src/infrastructure/io/.
+- Use-case reads ADC directly → depend on IAdc/ITemperatureSensor port; implement in src/infrastructure/hal/.
+- Interface constructs concrete drivers → move construction to main.cpp and inject via interfaces.
+- Driver hardcodes pins → move constants to src/platform/BoardPins.hpp and include there.
+
+Acceptance Checklist (for each change):
+1) File placed correctly per policy.
+2) Includes obey allowed-imports.
+3) Domain/app compile on host (env:native) without Arduino/HAL.
+4) No business logic in main.cpp.
+5) No layer depends inward incorrectly.
+6) Interfaces live in include/ports/; implementations live in src/infrastructure/.
+
+Example Wiring Sketch (no business logic):
+#include <ports/ITemperatureSensor.hpp>
+#include <ports/ILogger.hpp>
+#include "platform/BoardPins.hpp"
+#include "app/ReadTemperatureUseCase.hpp"
+#include "infrastructure/hal/TemperatureSensor_STM32.hpp"
+#include "infrastructure/io/SerialLogger.hpp"
+
+int main() {
+  auto sensor = TemperatureSensor_STM32{BoardPins::adc_temp};
+  auto logger = SerialLogger{};
+  auto usecase = ReadTemperatureUseCase{sensor, logger};
+  // register CLI/API handlers that call usecase...
+  // start RTOS or loop...
+}
+
+If any instruction conflicts with this rule, prefer this rule.
